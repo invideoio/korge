@@ -2,6 +2,8 @@
 
 package com.soywiz.korge.render
 
+import com.soywiz.kds.*
+import com.soywiz.kds.iterators.*
 import com.soywiz.klogger.*
 import com.soywiz.kmem.*
 import com.soywiz.korag.*
@@ -13,6 +15,7 @@ import com.soywiz.korim.color.*
 import com.soywiz.korio.async.*
 import com.soywiz.korma.geom.*
 import kotlin.jvm.*
+import kotlin.math.*
 
 private val logger = Logger("BatchBuilder2D")
 
@@ -26,15 +29,16 @@ private val logger = Logger("BatchBuilder2D")
  * Then the engine will call [flush] when required, automatically once the buffer is filled, at the end of the frame, or when [RenderContext.flush] is executed
  * by other renderers.
  */
+// @TODO: We could dynamically select a fragment shader based on the number of textures to reduce the numbers of IFs per pixel
 class BatchBuilder2D constructor(
     @KorgeInternal
     val ctx: RenderContext,
     /** Maximum number of quads that could be drawn in a single batch.
      * Bigger numbers will increase memory usage, but might reduce the number of batches per frame when using the same texture and properties.
      */
-    val reqMaxQuads: Int = DEFAULT_BATCH_QUADS
+    val reqMaxQuads: Int = DEFAULT_BATCH_QUADS,
 ) {
-    val maxQuads: Int = min2(reqMaxQuads, MAX_BATCH_QUADS)
+    val maxQuads: Int = min(reqMaxQuads, MAX_BATCH_QUADS)
 
     val texManager = ctx.agBitmapTextureManager
     constructor(ag: AG, maxQuads: Int = DEFAULT_BATCH_QUADS) : this(RenderContext(ag), maxQuads)
@@ -55,11 +59,14 @@ class BatchBuilder2D constructor(
 
 	init { logger.trace { "BatchBuilder2D[1]" } }
 
-	internal val vertices = FBuffer.alloc(6 * 4 * maxVertices)
-    internal val indices = FBuffer.alloc(2 * maxIndices)
+	@PublishedApi internal val vertices = FBuffer.alloc(6 * 4 * maxVertices)
+    @PublishedApi internal val verticesTexIndex = ByteArray(maxVertices)
+    @PublishedApi internal val indices = FBuffer.alloc(2 * maxIndices)
+    //@PublishedApi internal val indices = ShortArray(maxIndices)
     //internal val vertices = FBuffer.allocNoDirect(6 * 4 * maxVertices)
     //internal val indices = FBuffer.allocNoDirect(2 * maxIndices)
     val indicesI16 = indices.i16
+    //val indicesI16 = indices
     private val verticesI32 = vertices.i32
     private val verticesF32 = vertices.f32
     private val verticesData = vertices.data
@@ -67,18 +74,30 @@ class BatchBuilder2D constructor(
 
 	init { logger.trace { "BatchBuilder2D[2]" } }
 
-	var vertexCount = 0
-        internal set
-    internal var vertexPos = 0
-	internal var indexPos = 0
-	private var currentTex: AG.Texture? = null
-	private var currentSmoothing: Boolean = false
-	private var currentBlendFactors: AG.Blending = BlendMode.NORMAL.factors
-	private var currentProgram: Program? = null
+    @PublishedApi internal var _vertexCount = 0
+
+    var vertexCount: Int
+        get() = _vertexCount
+        internal set(value) { _vertexCount = value }
+
+    @PublishedApi internal var vertexPos = 0
+    @PublishedApi internal var indexPos = 0
+    @PublishedApi internal var currentTexIndex = 0
+
+    @PublishedApi internal var currentTexN: Array<AG.Texture?> = Array(BB_MAX_TEXTURES) { null }
+
+	//@PublishedApi internal var currentTex0: AG.Texture? = null
+    //@PublishedApi internal var currentTex1: AG.Texture? = null
+
+    @PublishedApi internal var currentSmoothing: Boolean = false
+
+    @PublishedApi internal var currentBlendFactors: AG.Blending = BlendMode.NORMAL.factors
+    @PublishedApi internal var currentProgram: Program? = null
 
 	init { logger.trace { "BatchBuilder2D[3]" } }
 
 	private val vertexBuffer = ag.createVertexBuffer()
+    private val texIndexVertexBuffer = ag.createVertexBuffer()
 	private val indexBuffer = ag.createIndexBuffer()
 
 	init { logger.trace { "BatchBuilder2D[4]" } }
@@ -122,21 +141,24 @@ class BatchBuilder2D constructor(
 
 	init { logger.trace { "BatchBuilder2D[9]" } }
 
-	private val textureUnit = AG.TextureUnit(null, linear = false)
+    val textureUnitN = Array(BB_MAX_TEXTURES) { AG.TextureUnit(null, linear = false) }
 
-	init { logger.trace { "BatchBuilder2D[10]" } }
+    //@KorgeInternal val textureUnit0 = AG.TextureUnit(null, linear = false)
+    //@KorgeInternal val textureUnit1 = AG.TextureUnit(null, linear = false)
+
+    init { logger.trace { "BatchBuilder2D[10]" } }
 
 	// @TODO: kotlin-native crash: [1]    80122 segmentation fault  ./sample1-native.kexe
 	//private val uniforms = mapOf<Uniform, Any>(
 	//	DefaultShaders.u_ProjMat to projMat,
 	//	DefaultShaders.u_Tex to textureUnit
 	//)
-	@PublishedApi
-	internal val uniforms by lazy {
+	@KorgeInternal
+	val uniforms by lazy {
 		AG.UniformValues(
 			DefaultShaders.u_ProjMat to projMat,
 			DefaultShaders.u_ViewMat to viewMat,
-			DefaultShaders.u_Tex to textureUnit
+            *Array(BB_MAX_TEXTURES) { u_TexN[it] to textureUnitN[it] }
 		)
 	}
 
@@ -146,47 +168,35 @@ class BatchBuilder2D constructor(
 
     fun readVertex(n: Int, out: VertexInfo = VertexInfo()): VertexInfo {
         out.read(this.vertices, n)
-        val source = textureUnit.texture?.source
+        val source = textureUnitN[0].texture?.source
         out.texWidth = source?.width ?: -1
         out.texHeight = source?.height ?: -1
         return out
     }
 
 	// @TODO: copy data from TexturedVertexArray
-	fun addVertex(x: Float, y: Float, u: Float, v: Float, colorMul: RGBA, colorAdd: ColorAdd) {
-        _addVertex(x, y, u, v, colorMul.value, colorAdd.value)
+	fun addVertex(x: Float, y: Float, u: Float, v: Float, colorMul: RGBA, colorAdd: ColorAdd, texIndex: Int = currentTexIndex) {
+        vertexPos += _addVertex(verticesFast32, vertexPos, x, y, u, v, colorMul.value, colorAdd.value, texIndex)
+        vertexCount++
 	}
 
-    fun _addVertex(x: Float, y: Float, u: Float, v: Float, colorMul: Int, colorAdd: Int) {
-        vertexPos += _addVertex(verticesFast32, vertexPos, x, y, u, v, colorMul, colorAdd)
-        vertexCount++
-    }
-
-    fun _addVertex(vd: Fast32Buffer, vp: Int, x: Float, y: Float, u: Float, v: Float, colorMul: Int, colorAdd: Int): Int {
+    fun _addVertex(vd: Fast32Buffer, vp: Int, x: Float, y: Float, u: Float, v: Float, colorMul: Int, colorAdd: Int, texIndex: Int = currentTexIndex): Int {
         vd.setF(vp + 0, x)
         vd.setF(vp + 1, y)
         vd.setF(vp + 2, u)
         vd.setF(vp + 3, v)
         vd.setI(vp + 4, colorMul)
         vd.setI(vp + 5, colorAdd)
-        return TexturedVertexArray.COMPONENTS_PER_VERTEX
+        verticesTexIndex[vp / 6] = texIndex.toByte()
+        //println("texIndex.toByte()=${texIndex.toByte()}")
+        return TEXTURED_ARRAY_COMPONENTS_PER_VERTEX
     }
 
-    fun _addVertex(f32: Float32Buffer, i32: Int32Buffer, vp: Int, x: Float, y: Float, u: Float, v: Float, colorMul: Int, colorAdd: Int): Int {
-        f32[vp + 0] = x
-        f32[vp + 1] = y
-        f32[vp + 2] = u
-        f32[vp + 3] = v
-        i32[vp + 4] = colorMul
-        i32[vp + 5] = colorAdd
-        return TexturedVertexArray.COMPONENTS_PER_VERTEX
-    }
-
-	fun addIndex(idx: Int) {
+	inline fun addIndex(idx: Int) {
 		indicesI16[indexPos++] = idx.toShort()
 	}
 
-    fun addIndexRelative(idx: Int) {
+    inline fun addIndexRelative(idx: Int) {
         indicesI16[indexPos++] = (vertexCount + idx).toShort()
     }
 
@@ -220,10 +230,9 @@ class BatchBuilder2D constructor(
 		x3: Float, y3: Float,
 		tex: Texture,
 		colorMul: RGBA, colorAdd: ColorAdd,
-        /** Not working right now */
-		rotated: Boolean = false
+        texIndex: Int = currentTexIndex
 	) {
-        drawQuadFast(x0, y0, x1, y1, x2, y2, x3, y3, tex.x0, tex.y0, tex.x1, tex.y1, colorMul, colorAdd, rotated)
+        drawQuadFast(x0, y0, x1, y1, x2, y2, x3, y3, tex.x0, tex.y0, tex.x1, tex.y1, colorMul, colorAdd, texIndex)
 	}
 
     fun drawQuadFast(
@@ -235,33 +244,11 @@ class BatchBuilder2D constructor(
         tx1: Float, ty1: Float,
         colorMul: RGBA,
         colorAdd: ColorAdd,
-        rotated: Boolean
-    ) {
-        ensure(6, 4)
-
-        addQuadIndices()
-
-        if (rotated) {
-            // @TODO:
-            addQuadVerticesFastRotated(x0, y0, x1, y1, x2, y2, x3, y3, tx0, ty0, tx1, ty1, colorMul, colorAdd)
-        } else {
-            addQuadVerticesFastNormal(x0, y0, x1, y1, x2, y2, x3, y3, tx0, ty0, tx1, ty1, colorMul.value, colorAdd.value)
-        }
-    }
-
-    fun drawQuadFast(
-        x0: Float, y0: Float,
-        x1: Float, y1: Float,
-        x2: Float, y2: Float,
-        x3: Float, y3: Float,
-        tx0: Float, ty0: Float,
-        tx1: Float, ty1: Float,
-        colorMul: RGBA,
-        colorAdd: ColorAdd
+        texIndex: Int = currentTexIndex
     ) {
         ensure(6, 4)
         addQuadIndices()
-        addQuadVerticesFastNormal(x0, y0, x1, y1, x2, y2, x3, y3, tx0, ty0, tx1, ty1, colorMul.value, colorAdd.value)
+        addQuadVerticesFastNormal(x0, y0, x1, y1, x2, y2, x3, y3, tx0, ty0, tx1, ty1, colorMul.value, colorAdd.value, texIndex)
     }
 
     @JvmOverloads
@@ -290,8 +277,9 @@ class BatchBuilder2D constructor(
         tx1: Float, ty1: Float,
         colorMul: Int,
         colorAdd: Int,
+        texIndex: Int = currentTexIndex
     ) {
-        vertexPos = _addQuadVerticesFastNormal(vertexPos, verticesFast32, x0, y0, x1, y1, x2, y2, x3, y3, tx0, ty0, tx1, ty1, colorMul, colorAdd)
+        vertexPos = _addQuadVerticesFastNormal(vertexPos, verticesFast32, x0, y0, x1, y1, x2, y2, x3, y3, tx0, ty0, tx1, ty1, colorMul, colorAdd, texIndex)
         vertexCount += 4
     }
 
@@ -306,12 +294,13 @@ class BatchBuilder2D constructor(
         tx1: Float, ty1: Float,
         colorMul: Int,
         colorAdd: Int,
+        texIndex: Int = currentTexIndex,
     ): Int {
         var vp = vp
-        vp += _addVertex(vd, vp, x0, y0, tx0, ty0, colorMul, colorAdd)
-        vp += _addVertex(vd, vp, x1, y1, tx1, ty0, colorMul, colorAdd)
-        vp += _addVertex(vd, vp, x2, y2, tx1, ty1, colorMul, colorAdd)
-        vp += _addVertex(vd, vp, x3, y3, tx0, ty1, colorMul, colorAdd)
+        vp += _addVertex(vd, vp, x0, y0, tx0, ty0, colorMul, colorAdd, texIndex)
+        vp += _addVertex(vd, vp, x1, y1, tx1, ty0, colorMul, colorAdd, texIndex)
+        vp += _addVertex(vd, vp, x2, y2, tx1, ty1, colorMul, colorAdd, texIndex)
+        vp += _addVertex(vd, vp, x3, y3, tx0, ty1, colorMul, colorAdd, texIndex)
         return vp
     }
 
@@ -324,53 +313,77 @@ class BatchBuilder2D constructor(
         tx1: Float, ty1: Float,
         colorMul: Int,
         colorAdd: Int,
+        texIndex: Int = currentTexIndex,
     ): Int {
         var vp = vp
-        vp += _addVertex(vd, vp, x0, y0, tx0, ty0, colorMul, colorAdd)
-        vp += _addVertex(vd, vp, x1, y0, tx1, ty0, colorMul, colorAdd)
-        vp += _addVertex(vd, vp, x1, y1, tx1, ty1, colorMul, colorAdd)
-        vp += _addVertex(vd, vp, x0, y1, tx0, ty1, colorMul, colorAdd)
+        vp += _addVertex(vd, vp, x0, y0, tx0, ty0, colorMul, colorAdd, texIndex)
+        vp += _addVertex(vd, vp, x1, y0, tx1, ty0, colorMul, colorAdd, texIndex)
+        vp += _addVertex(vd, vp, x1, y1, tx1, ty1, colorMul, colorAdd, texIndex)
+        vp += _addVertex(vd, vp, x0, y1, tx0, ty1, colorMul, colorAdd, texIndex)
         return vp
-    }
-
-    fun addQuadVerticesFastRotated(
-        x0: Float, y0: Float,
-        x1: Float, y1: Float,
-        x2: Float, y2: Float,
-        x3: Float, y3: Float,
-        tx0: Float, ty0: Float,
-        tx1: Float, ty1: Float,
-        colorMul: RGBA,
-        colorAdd: ColorAdd,
-    ) {
-        // @TODO:
-        addVertex(x0, y0, tx0, ty0, colorMul, colorAdd)
-        addVertex(x1, y1, tx1, ty0, colorMul, colorAdd)
-        addVertex(x2, y2, tx1, ty1, colorMul, colorAdd)
-        addVertex(x3, y3, tx0, ty1, colorMul, colorAdd)
     }
 
     /**
      * Draws/buffers a set of textured and colorized array of vertices [array] with the current state previously set by calling [setStateFast].
      */
-	fun drawVertices(array: TexturedVertexArray, vcount: Int = array.vcount, icount: Int = array.isize) {
-		ensure(icount, vcount)
+    fun drawVertices(array: TexturedVertexArray, matrix: Matrix?, vcount: Int = array.vcount, icount: Int = array.isize, texIndex: Int = currentTexIndex) {
+        ensure(icount, vcount)
 
-		for (idx in 0 until min2(icount, array.isize)) addIndex(vertexCount + array.indices[idx])
-		//for (p in array.points) addVertex(p.x, p.y, p.tx, p.ty, p.colMul, p.colAdd)
+        val i16 = indicesI16
+        val ip = indexPos
+        val vc = vertexCount
+        val arrayIndices = array.indices
+        val icount = min(icount, array.isize)
 
-		FBuffer.copy(array._data, 0, vertices, vertexPos * 4, vcount * 6 * 4)
-		//vertices.setAlignedArrayInt32(vertexPos, array.data, 0, vcount * 6)
-		vertexCount += vcount
-		vertexPos += vcount * 6
-	}
+        arraycopy(arrayIndices, 0, i16, ip, icount)
+        arrayadd(i16, vc.toShort(), ip, ip + icount)
+        //for (n in 0 until icount) i16[ip + n] = (vc + arrayIndices[n]).toShort()
+
+        val vp = vertexPos
+        val src = array._data.i32
+        val dst = vertices.i32
+        arraycopy(src, 0, dst, vp, vcount * 6)
+        //for (n in 0 until vcount * 6) dst[vp + n] = src[n]
+
+        //println("texIndex=$texIndex")
+        val vp6 = vertexPos / 6
+        arrayfill(verticesTexIndex, texIndex.toByte(), vp6, vp6 + vcount)
+
+        if (matrix != null) {
+            applyMatrix(matrix, vertexPos, vcount)
+        }
+
+        _vertexCount += vcount
+        vertexPos += vcount * 6
+        indexPos += icount
+    }
+
+    private fun applyMatrix(matrix: Matrix, idx: Int, vcount: Int) {
+        val f32 = vertices.f32
+        var idx = idx
+
+        val ma = matrix.af
+        val mb = matrix.bf
+        val mc = matrix.cf
+        val md = matrix.df
+        val mtx = matrix.txf
+        val mty = matrix.tyf
+
+        for (n in 0 until vcount) {
+            val x = f32[idx + 0]
+            val y = f32[idx + 1]
+            f32[idx + 0] = Matrix.transformXf(ma, mb, mc, md, mtx, mty, x, y)
+            f32[idx + 1] = Matrix.transformYf(ma, mb, mc, md, mtx, mty, x, y)
+            idx += VERTEX_INDEX_SIZE
+        }
+    }
 
     /**
      * Draws/buffers a set of textured and colorized array of vertices [array] with the specified texture [tex] and optionally [smoothing] it and an optional [program].
      */
-	fun drawVertices(array: TexturedVertexArray, tex: Texture.Base, smoothing: Boolean, blendFactors: AG.Blending, vcount: Int = array.vcount, icount: Int = array.isize, program: Program? = null) {
-		setStateFast(tex, smoothing, blendFactors, program)
-		drawVertices(array, vcount, icount)
+    inline fun drawVertices(array: TexturedVertexArray, tex: Texture.Base, smoothing: Boolean, blendFactors: AG.Blending, vcount: Int = array.vcount, icount: Int = array.isize, program: Program? = null, matrix: Matrix? = null) {
+        setStateFast(tex.base, smoothing, blendFactors, program)
+        drawVertices(array, matrix, vcount, icount)
 	}
 
 	private fun checkAvailable(indices: Int, vertices: Int): Boolean {
@@ -391,13 +404,43 @@ class BatchBuilder2D constructor(
     /**
      * Sets the current texture [tex], [smoothing], [blendFactors] and [program] that will be used by the following drawing calls not specifying these attributes.
      */
-	fun setStateFast(tex: AG.Texture?, smoothing: Boolean, blendFactors: AG.Blending, program: Program?) {
-        if (tex === currentTex && currentSmoothing === smoothing && currentBlendFactors === blendFactors && currentProgram === program) return
+    inline fun setStateFast(tex: AG.Texture?, smoothing: Boolean, blendFactors: AG.Blending, program: Program?) {
+        val isCurrentStateFast = isCurrentStateFast(tex, smoothing, blendFactors, program)
+        //println("isCurrentStateFast=$isCurrentStateFast, tex=$tex, currentTex=$currentTex, currentTex2=$currentTex2")
+        if (isCurrentStateFast) return
         flush()
-        currentTex = tex
+        currentTexIndex = 0
+        currentTexN[0] = tex
         currentSmoothing = smoothing
         currentBlendFactors = if (tex != null && tex.isFbo) blendFactors.toRenderFboIntoBack() else blendFactors
         currentProgram = program
+    }
+
+    fun hasTex(tex: AG.Texture?): Boolean {
+        currentTexN.fastForEach { if (it === tex) return true }
+        return false
+    }
+
+    @PublishedApi internal fun isCurrentStateFast(tex: AG.Texture?, smoothing: Boolean, blendFactors: AG.Blending, program: Program?): Boolean {
+        var hasTex = hasTex(tex)
+        if (currentTexN[0] !== null && !hasTex) {
+            for (n in 1 until currentTexN.size) {
+                if (currentTexN[n] === null) {
+                    currentTexN[n] = tex
+                    hasTex = true
+                    break
+                }
+            }
+        }
+
+        for (n in currentTexN.indices) {
+            if (tex === currentTexN[n]) {
+                currentTexIndex = n
+                break
+            }
+        }
+
+        return hasTex && (currentSmoothing == smoothing) && (currentBlendFactors === blendFactors) && (currentProgram === program)
     }
 
     fun setStateFast(tex: Bitmap, smoothing: Boolean, blendFactors: AG.Blending, program: Program?) {
@@ -447,9 +490,10 @@ class BatchBuilder2D constructor(
 		colorMul: RGBA = Colors.WHITE,
 		colorAdd: ColorAdd = ColorAdd.NEUTRAL,
 		blendFactors: AG.Blending = BlendMode.NORMAL.factors,
-		program: Program? = null
+		program: Program? = null,
 	) {
 		setStateFast(tex.base, filtering, blendFactors, program)
+        val texIndex: Int = currentTexIndex
 
 		ensure(indices = 6 * 9, vertices = 4 * 4)
 
@@ -486,7 +530,7 @@ class BatchBuilder2D constructor(
 					)
 				)
 
-				addVertex(p.x.toFloat(), p.y.toFloat(), t.x.toFloat(), t.y.toFloat(), colorMul, colorAdd)
+				addVertex(p.x.toFloat(), p.y.toFloat(), t.x.toFloat(), t.y.toFloat(), colorMul, colorAdd, texIndex)
 			}
 		}
 
@@ -529,24 +573,20 @@ class BatchBuilder2D constructor(
 		colorMul: RGBA = Colors.WHITE,
 		colorAdd: ColorAdd = ColorAdd.NEUTRAL,
 		blendFactors: AG.Blending = BlendMode.NORMAL.factors,
-        /** Not working right now */
-		rotated: Boolean = false,
 		program: Program? = null
 	) {
-		val x0 = x.toDouble()
-		val x1 = (x + width).toDouble()
-		val y0 = y.toDouble()
-		val y1 = (y + height).toDouble()
-
-		setStateFast(tex.base, filtering, blendFactors, program)
-
-		drawQuadFast(
+        val x0 = x
+        val x1 = (x + width)
+        val y0 = y
+        val y1 = (y + height)
+        setStateFast(tex.base, filtering, blendFactors, program)
+        drawQuadFast(
             m.transformXf(x0, y0), m.transformYf(x0, y0),
             m.transformXf(x1, y0), m.transformYf(x1, y0),
             m.transformXf(x1, y1), m.transformYf(x1, y1),
             m.transformXf(x0, y1), m.transformYf(x0, y1),
-			tex, colorMul, colorAdd, rotated
-		)
+        	tex, colorMul, colorAdd
+        )
 	}
 
 	companion object {
@@ -567,14 +607,25 @@ class BatchBuilder2D constructor(
         @KorgeInternal
 		val v_ColAdd = Varying("v_Col2", VarType.Byte4)
 
+        val a_TexIndex = Attribute("a_TexIndex", VarType.UByte1, normalized = false, precision = Precision.LOW)
+        val v_TexIndex = Varying("v_TexIndex", VarType.Float1, precision = Precision.LOW)
+        //val u_Tex0 = Uniform("u_Tex0", VarType.TextureUnit)
+
+        val u_TexN = Array(BB_MAX_TEXTURES) { Uniform("u_Tex$it", VarType.TextureUnit) }
+        //val u_Tex0 = DefaultShaders.u_Tex
+        //val u_Tex1 = Uniform("u_Tex1", VarType.TextureUnit)
+
 		init { logger.trace { "BatchBuilder2D.Companion[2]" } }
 
         @KorgeInternal
 		val LAYOUT = VertexLayout(DefaultShaders.a_Pos, DefaultShaders.a_Tex, a_ColMul, a_ColAdd)
         @KorgeInternal
+        val LAYOUT_TEX_INDEX = VertexLayout(a_TexIndex)
+        @KorgeInternal
 		val VERTEX = VertexShader {
 			DefaultShaders.apply {
 				SET(v_Tex, a_Tex)
+                SET(v_TexIndex, a_TexIndex)
 				SET(v_ColMul, a_ColMul)
 				SET(v_ColAdd, a_ColAdd)
 				SET(out, (u_ProjMat * u_ViewMat) * vec4(DefaultShaders.a_Pos, 0f.lit, 1f.lit))
@@ -583,30 +634,42 @@ class BatchBuilder2D constructor(
 
 		init { logger.trace { "BatchBuilder2D.Companion[3]" } }
 
-        @KorgeInternal
-        val FRAGMENT_PRE = buildTextureLookupFragment(premultiplied = true)
+        private fun getShaderProgramIndex(premultiplied: Boolean, preadd: Boolean): Int {
+            return 0.insert(premultiplied, 0).insert(preadd, 1)
+        }
+
+        private val FRAGMENTS = Array(4) { index ->
+            val premultiplied = index.extractBool(0)
+            val preadd = index.extractBool(1)
+            buildTextureLookupFragment(premultiplied = premultiplied, preadd = preadd)
+        }
 
         @KorgeInternal
-        val FRAGMENT_NOPRE = buildTextureLookupFragment(premultiplied = false)
+        val FRAGMENT_PRE = FRAGMENTS[getShaderProgramIndex(premultiplied = true, preadd = false)]
 
         @KorgeInternal
-		val PROGRAM_PRE = Program(
-			vertex = VERTEX,
-			fragment = FRAGMENT_PRE,
-			name = "BatchBuilder2D.Premultiplied.Tinted"
-		)
+        val FRAGMENT_NOPRE = FRAGMENTS[getShaderProgramIndex(premultiplied = false, preadd = false)]
+
+        private val PROGRAMS = Array(4) { index ->
+            val premultiplied = index.extractBool(0)
+            val preadd = index.extractBool(1)
+            Program(
+                vertex = VERTEX,
+                fragment = FRAGMENTS[index],
+                name = "BatchBuilder2D.${if (premultiplied) "Premultiplied" else "NoPremultiplied"}.Tinted${if (preadd) ".Preadd" else ""}"
+            )
+        }
 
         @KorgeInternal
-		val PROGRAM_NOPRE = Program(
-			vertex = VERTEX,
-			fragment = FRAGMENT_NOPRE,
-			name = "BatchBuilder2D.NoPremultiplied.Tinted"
-		)
+		val PROGRAM_PRE = PROGRAMS[getShaderProgramIndex(true, false)]
+
+        @KorgeInternal
+		val PROGRAM_NOPRE = PROGRAMS[getShaderProgramIndex(false, false)]
 
 		init { logger.trace { "BatchBuilder2D.Companion[4]" } }
 
         @KorgeInternal
-        fun getTextureLookupProgram(premultiplied: Boolean) = if (premultiplied) PROGRAM_PRE else PROGRAM_NOPRE
+        fun getTextureLookupProgram(premultiplied: Boolean, preadd: Boolean = false) = PROGRAMS[getShaderProgramIndex(premultiplied, preadd)]
 
 		//val PROGRAM_NORMAL = Program(
 		//	vertex = VERTEX,
@@ -619,22 +682,30 @@ class BatchBuilder2D constructor(
 		//	name = "BatchBuilder2D.Tinted"
 		//)
 
-        fun getTextureLookupFragment(premultiplied: Boolean) = if (premultiplied) FRAGMENT_PRE else FRAGMENT_NOPRE
+        fun getTextureLookupFragment(premultiplied: Boolean, preadd: Boolean = false) = FRAGMENTS[getShaderProgramIndex(premultiplied, preadd)]
 
         /**
          * Builds a [FragmentShader] for textured and colored drawing that works matching if the texture is [premultiplied]
          */
         @KorgeInternal
-		fun buildTextureLookupFragment(premultiplied: Boolean) = FragmentShader {
+		fun buildTextureLookupFragment(premultiplied: Boolean, preadd: Boolean = false) = FragmentShader {
 			DefaultShaders.apply {
-				SET(out, texture2D(u_Tex, v_Tex["xy"]))
+                for (n in 0 until BB_MAX_TEXTURES) {
+                    IF(v_TexIndex eq (n.toFloat()).lit) {
+                        SET(out, texture2D(u_TexN[n], v_Tex["xy"]))
+                    }
+                }
 				if (premultiplied) {
 					SET(out["rgb"], out["rgb"] / out["a"])
 				}
 
 				// @TODO: Kotlin.JS bug?
 				//SET(out, (out["rgba"] * v_ColMul["rgba"]) + ((v_ColAdd["rgba"] - vec4(.5f, .5f, .5f, .5f)) * 2f))
-				SET(out, (out["rgba"] * v_ColMul["rgba"]) + ((v_ColAdd["rgba"] - vec4(.5f.lit, .5f.lit, .5f.lit, .5f.lit)) * 2f.lit))
+                if (preadd) {
+                    SET(out, (clamp(out["rgba"] + ((BatchBuilder2D.v_ColAdd["rgba"] - vec4(.5f.lit, .5f.lit, .5f.lit, .5f.lit)) * 2f.lit), 0f.lit, 1f.lit) * BatchBuilder2D.v_ColMul["rgba"]))
+                } else {
+                    SET(out, (out["rgba"] * v_ColMul["rgba"]) + ((v_ColAdd["rgba"] - vec4(.5f.lit, .5f.lit, .5f.lit, .5f.lit)) * 2f.lit))
+                }
 
 				//SET(out, t_Temp1)
 				// Required for shape masks:
@@ -649,23 +720,41 @@ class BatchBuilder2D constructor(
 
 	private val tempRect = Rectangle()
     val beforeFlush = Signal<BatchBuilder2D>()
+    val onInstanceCount = Signal<Int>()
 
     fun uploadVertices() {
         vertexBuffer.upload(vertices, 0, vertexPos * 4)
+        texIndexVertexBuffer.upload(verticesTexIndex, 0, vertexPos / 6)
     }
 
     fun uploadIndices() {
         indexBuffer.upload(indices, 0, indexPos * 2)
     }
 
+    private val vertexData = fastArrayListOf(
+        AG.VertexData(vertexBuffer, LAYOUT),
+        AG.VertexData(texIndexVertexBuffer, LAYOUT_TEX_INDEX),
+    )
+
+    fun updateStandardUniforms() {
+        if (flipRenderTexture && ag.renderingToTexture) {
+            projMat.setToOrtho(tempRect.setBounds(0, ag.currentHeight, ag.currentWidth, 0), -1f, 1f)
+        } else {
+            projMat.setToOrtho(tempRect.setBounds(0, 0, ag.currentWidth, ag.currentHeight), -1f, 1f)
+        }
+
+        for (n in 0 until BB_MAX_TEXTURES) {
+            val textureUnit = textureUnitN[n]
+            textureUnit.texture = currentTexN[n]
+            textureUnit.linear = currentSmoothing
+        }
+    }
+
     /** When there are vertices pending, this performs a [AG.draw] call flushing all the buffered geometry pending to draw */
 	fun flush(uploadVertices: Boolean = true, uploadIndices: Boolean = true) {
+        //println("vertexCount=${vertexCount}")
 		if (vertexCount > 0) {
-			if (flipRenderTexture && ag.renderingToTexture) {
-				projMat.setToOrtho(tempRect.setBounds(0, ag.currentHeight, ag.currentWidth, 0), -1f, 1f)
-			} else {
-				projMat.setToOrtho(tempRect.setBounds(0, 0, ag.currentWidth, ag.currentHeight), -1f, 1f)
-			}
+            updateStandardUniforms()
 
 			//println("ORTHO: ${ag.backHeight.toFloat()}, ${ag.backWidth.toFloat()}")
 
@@ -674,22 +763,18 @@ class BatchBuilder2D constructor(
 			if (uploadVertices) uploadVertices()
             if (uploadIndices) uploadIndices()
 
-			textureUnit.texture = currentTex
-			textureUnit.linear = currentSmoothing
-
 			//println("MyUniforms: $uniforms")
 
 			val realFactors = if (ag.renderingToTexture) factors.toRenderImageIntoFbo() else factors
 
 			//println("RENDER: $realFactors")
 
-			ag.draw(
-				vertices = vertexBuffer,
-				indices = indexBuffer,
-				program = currentProgram ?: (if (currentTex?.premultiplied == true) PROGRAM_PRE else PROGRAM_NOPRE),
+			ag.drawV2(
+                vertexData = vertexData,
+                indices = indexBuffer,
+				program = currentProgram ?: (if (currentTexN[0]?.premultiplied == true) PROGRAM_PRE else PROGRAM_NOPRE),
 				//program = PROGRAM_PRE,
 				type = AG.DrawType.TRIANGLES,
-				vertexLayout = LAYOUT,
 				vertexCount = indexPos,
 				blending = realFactors,
 				uniforms = uniforms,
@@ -703,17 +788,9 @@ class BatchBuilder2D constructor(
 		vertexCount = 0
 		vertexPos = 0
 		indexPos = 0
-		currentTex = null
+        for (n in 0 until BB_MAX_TEXTURES) currentTexN[n] = null
+        currentTexIndex = 0
 	}
-
-	//private fun AG.Blending.toTextureRender(): AG.Blending {
-	//	//println("toTextureRender")
-	//	return when (this) {
-	//		BlendMode.NORMAL.factors -> BlendMode.ToTexture.NORMAL
-	//		//BlendMode.NORMAL.factors -> BlendMode.NORMAL.factors
-	//		else -> this
-	//	}
-	//}
 
     /**
      * Executes [callback] while setting temporarily the view matrix to [matrix]
@@ -765,243 +842,6 @@ class BatchBuilder2D constructor(
 	}
 }
 
-// @TODO: Call this mesh?
-/**
- * Allows to build a set of textured and colored vertices. Where [vcount] is the number of vertices and [isize] [indices],
- * the maximum number of indices.
- * 
- * [vcount] and [isize] could be decreased later, but not increased since the buffer is created at the beginning.
- */
-class TexturedVertexArray(var vcount: Int, val indices: IntArray, var isize: Int = indices.size) {
-    /** The initial/maximum number of vertices */
-	val initialVcount = vcount
-	//internal val data = IntArray(COMPONENTS_PER_VERTEX * vcount)
-	//internal val _data = FBuffer(COMPONENTS_PER_VERTEX * initialVcount * 4, direct = false)
-    internal val _data = FBuffer.allocNoDirect(COMPONENTS_PER_VERTEX * initialVcount * 4)
-    private val fast = _data.fast32
-	//private val f32 = _data.f32
-    //private val i32 = _data.i32
-	//val points = (0 until vcount).map { Item(data, it) }
-	//val icount = indices.size
-
-	companion object {
-        @KorgeInternal
-		const val COMPONENTS_PER_VERTEX = 6
-
-        @KorgeInternal
-		val QUAD_INDICES = intArrayOf(0, 1, 2,  3, 0, 2)
-
-        val EMPTY_INT_ARRAY = IntArray(0)
-
-        /** Builds indices for drawing triangles when the vertices information is stored as quads (4 vertices per quad primitive) */
-		fun quadIndices(quadCount: Int): IntArray {
-            if (quadCount == 0) return EMPTY_INT_ARRAY
-			val out = IntArray(quadCount * 6)
-			var m = 0
-			var base = 0
-			for (n in 0 until quadCount) {
-				out[m++] = base + 0
-				out[m++] = base + 1
-				out[m++] = base + 2
-				out[m++] = base + 3
-				out[m++] = base + 0
-				out[m++] = base + 2
-				base += 4
-			}
-			//QUAD_INDICES.repeat(quadCount)
-			return out
-		}
-	}
-
-	private var offset = 0
-    
-    /** Moves the cursor for setting vertexs to the vertex [i] */
-    fun select(i: Int): TexturedVertexArray {
-        offset = i * COMPONENTS_PER_VERTEX
-        return this
-    }
-    /** Sets the [x] of the vertex previously selected calling [select] */
-	fun setX(v: Float): TexturedVertexArray {
-        fast.setF(offset + 0, v)
-        return this
-    }
-    /** Sets the [y] of the vertex previously selected calling [select] */
-	fun setY(v: Float): TexturedVertexArray {
-        fast.setF(offset + 1, v)
-        return this
-    }
-    /** Sets the [u] (x in texture) of the vertex previously selected calling [select] */
-	fun setU(v: Float): TexturedVertexArray {
-        fast.setF(offset + 2, v)
-        return this
-    }
-    /** Sets the [v] (y in texture) of the vertex previously selected calling [select] */
-	fun setV(v: Float): TexturedVertexArray {
-        fast.setF(offset + 3, v)
-        return this
-    }
-    /** Sets the [cMul] (multiplicative color) of the vertex previously selected calling [select] */
-	fun setCMul(v: RGBA): TexturedVertexArray {
-        fast.setI(offset + 4, v.value)
-        return this
-    }
-    /** Sets the [cAdd] (additive color) of the vertex previously selected calling [select] */
-	fun setCAdd(v: ColorAdd): TexturedVertexArray {
-        fast.setI(offset + 5, v.value)
-        return this
-    }
-    /** Sets the [x] and [y] with the [matrix] transform applied of the vertex previously selected calling [select] */
-	fun xy(x: Double, y: Double, matrix: Matrix) = setX(matrix.transformXf(x, y)).setY(matrix.transformYf(x, y))
-    /** Sets the [x] and [y] of the vertex previously selected calling [select] */
-	fun xy(x: Double, y: Double) = setX(x.toFloat()).setY(y.toFloat())
-    /** Sets the [u] and [v] of the vertex previously selected calling [select] */
-	fun uv(tx: Float, ty: Float) = setU(tx).setV(ty)
-    /** Sets the [cMul] and [cAdd] (multiplicative and additive colors) of the vertex previously selected calling [select] */
-	fun cols(colMul: RGBA, colAdd: ColorAdd) = setCMul(colMul).setCAdd(colAdd)
-
-    fun quadV(index: Int, x: Float, y: Float, u: Float, v: Float, colMul: RGBA, colAdd: ColorAdd) {
-        quadV(fast, index * COMPONENTS_PER_VERTEX, x, y, u, v, colMul.value, colAdd.value)
-    }
-
-    fun quadV(fast: Fast32Buffer, pos: Int, x: Float, y: Float, u: Float, v: Float, colMul: Int, colAdd: Int): Int {
-        fast.setF(pos + 0, x)
-        fast.setF(pos + 1, y)
-        fast.setF(pos + 2, u)
-        fast.setF(pos + 3, v)
-        fast.setI(pos + 4, colMul)
-        fast.setI(pos + 5, colAdd)
-        return COMPONENTS_PER_VERTEX
-    }
-
-    fun quadV(index: Int, x: Double, y: Double, u: Float, v: Float, colMul: RGBA, colAdd: ColorAdd) = quadV(index, x.toFloat(), y.toFloat(), u, v, colMul, colAdd)
-
-    /**
-     * Sets a textured quad at vertice [index] with the region defined by [x],[y] [width]x[height] and the [matrix],
-     * using the texture coords defined by [BmpSlice] and color transforms [colMul] and [colAdd]
-     */
-    @OptIn(KorgeInternal::class)
-	fun quad(index: Int, x: Double, y: Double, width: Double, height: Double, matrix: Matrix, bmp: BmpSlice, colMul: RGBA, colAdd: ColorAdd) {
-        quad(index, x.toFloat(), y.toFloat(), width.toFloat(), height.toFloat(), matrix, bmp, colMul, colAdd)
-	}
-
-    @OptIn(KorgeInternal::class)
-    fun quad(index: Int, x: Float, y: Float, width: Float, height: Float, matrix: Matrix, bmp: BmpSlice, colMul: RGBA, colAdd: ColorAdd) {
-        val xw = x + width
-        val yh = y + height
-
-        /*
-        val x0 = matrix.transformXf(x, y)
-        val x1 = matrix.transformXf(xw, y)
-        val x2 = matrix.transformXf(xw, yh)
-        val x3 = matrix.transformXf(x, yh)
-
-        val y0 = matrix.transformYf(x, y)
-        val y1 = matrix.transformYf(xw, y)
-        val y2 = matrix.transformYf(xw, yh)
-        val y3 = matrix.transformYf(x, yh)
-        */
-
-        val af = matrix.af
-        val cf = matrix.cf
-        val txf = matrix.txf
-        val x0 = af * x + cf * y + txf
-        val x1 = af * xw + cf * y + txf
-        val x2 = af * xw + cf * yh + txf
-        val x3 = af * x + cf * yh + txf
-
-        val df = matrix.df
-        val bf = matrix.bf
-        val tyf = matrix.tyf
-        val y0 = df * y + bf * x + tyf
-        val y1 = df * y + bf * xw + tyf
-        val y2 = df * yh + bf * xw + tyf
-        val y3 = df * yh + bf * x + tyf
-
-        val fast = this.fast
-        var pos = index * COMPONENTS_PER_VERTEX
-        val cm = colMul.value
-        val ca = colAdd.value
-        pos += quadV(fast, pos, x0, y0, bmp.tl_x, bmp.tl_y, cm, ca)
-        pos += quadV(fast, pos, x1, y1, bmp.tr_x, bmp.tr_y, cm, ca)
-        pos += quadV(fast, pos, x2, y2, bmp.br_x, bmp.br_y, cm, ca)
-        pos += quadV(fast, pos, x3, y3, bmp.bl_x, bmp.bl_y, cm, ca)
-    }
-
-	private val bounds: BoundsBuilder = BoundsBuilder()
-
-    /**
-     * Returns the bounds of the vertices defined in the indices from [min] to [max] (excluding) as [Rectangle]
-     * Allows to define the output as [out] to be allocation-free, setting the [out] [Rectangle] and returning it.
-     */
-    fun getBounds(min: Int = 0, max: Int = vcount, out: Rectangle = Rectangle()): Rectangle {
-		bounds.reset()
-		for (n in min until max) {
-			select(n)
-			bounds.add(x.toDouble(), y.toDouble())
-		}
-		return bounds.getBounds(out)
-	}
-
-    /** [x] at the previously vertex selected by calling [select] */
-	val x: Float get() = fast.getF(offset + 0)
-    /** [y] at the previously vertex selected by calling [select] */
-	val y: Float get() = fast.getF(offset + 1)
-    /** [u] (x in texture) at the previously vertex selected by calling [select] */
-	val u: Float get() = fast.getF(offset + 2)
-    /** [v] (y in texture) at the previously vertex selected by calling [select] */
-	val v: Float get() = fast.getF(offset + 3)
-    /** [cMul] (multiplicative color) at the previously vertex selected by calling [select] */
-	val cMul: Int get() = fast.getI(offset + 4)
-    /** [cAdd] (additive color) at the previously vertex selected by calling [select] */
-	val cAdd: Int get() = fast.getI(offset + 5)
-
-    /** Describes the vertice previously selected by calling [select] */
-	val vertexString: String get() = "V(xy=($x, $y),uv=$u, $v,cMul=$cMul,cAdd=$cAdd)"
-
-    /** Describes a vertex at [index] */
-	fun str(index: Int): String {
-		val old = this.offset
-		try {
-			return select(index).vertexString
-		} finally {
-			this.offset = old
-		}
-	}
-
-	//class Item(private val data: IntArray, index: Int) {
-	//	val offset = index * COMPONENTS_PER_VERTEX
-	//	var x: Float; get() = Float.fromBits(data[offset + 0]); set(v) { data[offset + 0] = v.toBits() }
-	//	var y: Float; get() = Float.fromBits(data[offset + 1]); set(v) { data[offset + 1] = v.toBits() }
-	//	var tx: Float; get() = Float.fromBits(data[offset + 2]); set(v) { data[offset + 2] = v.toBits() }
-	//	var ty: Float; get() = Float.fromBits(data[offset + 3]); set(v) { data[offset + 3] = v.toBits() }
-	//	var colMul: Int; get() = data[offset + 4]; set(v) { data[offset + 4] = v }
-	//	var colAdd: Int; get() = data[offset + 5]; set(v) { data[offset + 5] = v }
-	//	fun setXY(x: Double, y: Double, matrix: Matrix) {
-	//		this.x = matrix.transformX(x, y).toFloat()
-	//		this.y = matrix.transformY(x, y).toFloat()
-	//	}
-	//	fun setXY(x: Double, y: Double) { this.x = x.toFloat() }.also { this.y = y.toFloat() }
-	//	fun setTXY(tx: Float, ty: Float) { this.tx = tx }.also { this.ty = ty }
-	//	fun setCols(colMul: Int, colAdd: Int) { this.colMul = colMul }.also { this.colAdd = colAdd }
-	//}
-}
-
-/*
-// @TODO: Move to the right place
-private fun IntArray.repeat(count: Int): IntArray {
-	val out = IntArray(this.size * count)
-
-	for (n in 0 until out.size) out[n] = this[n % this.size]
-
-	//if (count > 0) {
-	//	arraycopy(this, 0, out, 0, this.size)
-	//	if (count > 1) {
-	//		// This should work because of overlapping!
-	//		arraycopy(out, 0, out, this.size, (count - 1) * this.size)
-	//	}
-	//}
-
-	//for (n in 0 until count) arraycopy(this, 0, out, n * this.size, this.size)
-	return out
-}
-*/
+//internal const val BB_MAX_TEXTURES = 6
+internal const val BB_MAX_TEXTURES = 4
+//internal const val BB_MAX_TEXTURES = 2
