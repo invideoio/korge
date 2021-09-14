@@ -186,9 +186,9 @@ object Korge {
                 prepareViews(views, gameWindow, bgcolor != null, bgcolor ?: Colors.TRANSPARENT_BLACK, waitForFirstRender = true)
             }
 
-            gameWindow.registerTime("nativeSoundProvider") {
+/*            gameWindow.registerTime("nativeSoundProvider") {
                 nativeSoundProvider.initOnce()
-            }
+            }*/
             gameWindow.registerTime("completeViews") {
                 completeViews(views)
             }
