@@ -160,7 +160,7 @@ class BatchBuilder2D constructor(
 			DefaultShaders.u_ProjMat to projMat,
 			DefaultShaders.u_ViewMat to viewMat,
             *Array(BB_MAX_TEXTURES) { u_TexN[it] to textureUnitN[it] },
-            DefaultShaders.u_TexTransformMat to texTransformMat
+            *Array(BB_MAX_TEXTURES) { DefaultShaders.u_TexTransformMatN[it] to texTransformMat }
         )
 	}
 
@@ -694,7 +694,7 @@ class BatchBuilder2D constructor(
 			DefaultShaders.apply {
                 for (n in 0 until BB_MAX_TEXTURES) {
                     IF(v_TexIndex eq (n.toFloat()).lit) {
-                        SET(out, texture2D(u_TexN[n], (u_TexTransformMat * vec4(v_Tex["xy"], 0f.lit, 1f.lit))["xy"]))
+                        SET(out, texture2D(u_TexN[n], (u_TexTransformMatN[n] * vec4(v_Tex["xy"], 0f.lit, 1f.lit))["xy"]))
                     }
                 }
 				if (premultiplied) {
@@ -747,13 +747,6 @@ class BatchBuilder2D constructor(
 
         for (n in 0 until BB_MAX_TEXTURES) {
             val textureUnit = textureUnitN[n]
-            if (n == 0) {
-                texTransformMat.setColumns4x4(
-                    (currentTexN[n]?.transform ?: Matrix3D()).run { data }, 0
-                )
-                // println("tex transform mat: $texTransformMat")
-                uniforms[DefaultShaders.u_TexTransformMat] = texTransformMat
-            }
             textureUnit.texture = currentTexN[n]
             textureUnit.linear = currentSmoothing
         }
