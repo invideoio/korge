@@ -1,5 +1,6 @@
 package com.soywiz.korge.view.filter
 
+import com.soywiz.korag.AGOpengl
 import com.soywiz.korge.render.*
 import com.soywiz.korge.view.*
 import com.soywiz.korim.color.*
@@ -32,6 +33,10 @@ open class IdentityFilter(val smoothing: Boolean) : Filter {
             blendFactors = blendMode.factors,
             program = BatchBuilder2D.getTextureLookupProgram(texture.premultiplied)
         )
+        ctx.batch.flush()
+        if (ctx.ag is AGOpengl) {
+            ctx.ag.gl.finish()
+        }
     }
 }
 
