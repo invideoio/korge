@@ -741,6 +741,8 @@ class BatchBuilder2D constructor(
     fun updateStandardUniforms() {
         if (flipRenderTexture && ag.renderingToTexture) {
             projMat.setToOrtho(tempRect.setBounds(0, ag.currentHeight, ag.currentWidth, 0), -1f, 1f)
+        } else if (ag.flipRender) {
+            projMat.setToOrtho(tempRect.setBounds(ag.currentWidth, ag.currentHeight, 0, 0), -1f, 1f)
         } else {
             projMat.setToOrtho(tempRect.setBounds(0, 0, ag.currentWidth, ag.currentHeight), -1f, 1f)
         }
