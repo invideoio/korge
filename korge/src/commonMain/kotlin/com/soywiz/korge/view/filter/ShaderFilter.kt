@@ -102,10 +102,7 @@ abstract class ShaderFilter : Filter {
                 blendFactors = blendMode.factors,
                 program = if (texture.premultiplied) programPremult else programNormal
             )
-            ctx.batch.flush()
-            if (ctx.ag is AGOpengl) {
-                ctx.ag.gl.finish()
-            }
+            //ctx.batch.flush()
         }
     }
 }
