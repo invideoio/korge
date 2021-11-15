@@ -473,6 +473,8 @@ class Components {
 
     inline fun <reified T : UpdateComponent> getComponentUpdate(): T? = findFirstComponentOfType(eupdate, T::class).fastCastTo<T?>()
 
+    inline fun <reified T : UpdateComponent> getUpdateComponents(): List<T> = eupdate.filterIsInstance<T>()
+
     fun <T : Component> findFirstComponentOfType(array: FastArrayList<T>, clazz: KClass<out T>): T? {
         array.fastForEach { if (it::class == clazz) return it }
         return null
