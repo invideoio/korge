@@ -16,6 +16,7 @@ import com.soywiz.korge.scene.*
 import com.soywiz.korgw.*
 import com.soywiz.korio.lang.*
 import kotlin.reflect.*
+import kotlin.native.concurrent.SharedImmutable
 
 @OptIn(KorgeInternal::class)
 class MouseEvents(override val view: View) : MouseComponent, Extra by Extra.Mixin() {
@@ -400,6 +401,7 @@ class MouseEvents(override val view: View) : MouseComponent, Extra by Extra.Mixi
 
 //var View.mouseEnabled by Extra.Property { true }
 
+@SharedImmutable
 val View.mouse by Extra.PropertyThis<View, MouseEvents> { this.getOrCreateComponentMouse<MouseEvents> { MouseEvents(this) } }
 inline fun <T> View.mouse(callback: MouseEvents.() -> T): T = mouse.run(callback)
 
@@ -444,6 +446,7 @@ fun MouseEvents.multiClick(count: Int, callback: (MouseEvents) -> Unit): Closeab
     }
 }
 
+@SharedImmutable
 var View.cursor: GameWindow.ICursor? by extraProperty { null }
 //    get() = mouse.cursor
 //    set(value) { mouse.cursor = value }
