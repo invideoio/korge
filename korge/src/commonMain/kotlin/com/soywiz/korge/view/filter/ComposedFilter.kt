@@ -55,8 +55,6 @@ class ComposedFilter(val filters: List<Filter>) : Filter {
 		}, { newtex ->
 			if (level > 0) {
 				renderIndex(ctx, matrix, newtex, newtex.width, newtex.height, renderColorAdd, renderColorMul, blendMode, level - 1)
-			} else {
-				filter.render(ctx, matrix, newtex, newtex.width, newtex.height, renderColorAdd, renderColorMul, blendMode)
 			}
 		})
 	}
